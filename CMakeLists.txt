@@ -8,8 +8,8 @@ endif()
 find_package(ament_cmake REQUIRED)
 
 install(PROGRAMS
-  scripts/serial_bridge.py
-  scripts/robot_logic.py
+  robot-core/serial_bridge.py
+  robot-core/robot_logic.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
