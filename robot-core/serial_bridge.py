@@ -72,10 +72,10 @@ class SerialBridge(Node):
     # ── cmd_vel → V,vd,wd ────────────────────────────────────────────────────
 
     def cmd_vel_callback(self, msg: Twist):
-        """
+        """"""
         Forward linear and angular velocity directly to the Arduino.
         The Arduino PI controller handles converting these to motor PWM.
-        """
+        """"""
         vd = msg.linear.x
         wd = msg.angular.z
         command = f'V,{vd:.4f},{wd:.4f}\n'
