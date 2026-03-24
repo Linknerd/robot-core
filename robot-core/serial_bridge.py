@@ -15,6 +15,7 @@ Serial protocol (Pi → Arduino):
   S\n                         Stop
 """
 
+"""
 import math
 import threading
 
@@ -216,6 +217,200 @@ def main(args=None):
     rclpy.spin(node)
     node.destroy_node()
     rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
+"""
+#!/usr/bin/env python3
+"""
+serial_bridge.py — ROS2 Humble
+Bridges the Arduino (robot_controller) to ROS2 topics.
+
+Serial protocol  (Arduino → Pi):
+  O,linear_m_s,angular_rad_s   Odometry velocities, sent every T ms
+  READY                         Emitted once on Arduino boot
+
+Serial protocol  (Pi → Arduino):
+  V,vd,wd\\n                    Desired linear [m/s] and angular [rad/s] velocity
+  S\\n                          Emergency stop
+"""
+
+import math
+import threading
+
+import rclpy
+from rclpy.node import Node
+
+import serial
+
+from geometry_msgs.msg import Twist, TransformStamped
+from nav_msgs.msg import Odometry
+from tf2_ros import TransformBroadcaster
+
+
+# ── Pose covariances (diagonal values) ────────────────────────────────────────
+POSE_COV_XY    = 0.05   # [m²]
+POSE_COV_THETA = 0.10   # [rad²]
+TWIST_COV_V    = 0.01   # [(m/s)²]
+TWIST_COV_W    = 0.05   # [(rad/s)²]
+
+
+class SerialBridge(Node):
+
+    def __init__(self):
+        super().__init__('serial_bridge')
+        self.get_logger().info('Serial Bridge node starting…')
+
+        # ── Serial port ──────────────────────────────────────────────────────
+        # Must match Serial.begin() in robot_controller.ino.
+        self.port     = '/dev/ttyACM0'
+        self.baudrate = 115200   # ← was 9600 — caused total communication failure
+        try:
+            self.ser = serial.Serial(self.port, self.baudrate, timeout=1.0)
+            self.get_logger().info(f'Connected to Arduino on {self.port} @ {self.baudrate}')
+        except serial.SerialException as e:
+            self.get_logger().error(f'Failed to open serial port: {e}')
+            raise
+
+        # ── Odometry state ───────────────────────────────────────────────────
+        self.x     = 0.0
+        self.y     = 0.0
+        self.theta = 0.0
+        self.last_odom_time: float | None = None
+
+        # ── TF ───────────────────────────────────────────────────────────────
+        self.tf_broadcaster = TransformBroadcaster(self)
+
+        # ── Publishers ───────────────────────────────────────────────────────
+        self.odom_pub = self.create_publisher(Odometry, 'odom', 10)
+
+        # ── Subscriber ───────────────────────────────────────────────────────
+        self.create_subscription(Twist, 'cmd_vel', self._cmd_vel_cb, 10)
+
+        # ── Background serial reader ──────────────────────────────────────────
+        self._reader = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader.start()
+
+        self.get_logger().info('Serial Bridge ready.')
+
+    # ── cmd_vel → V,vd,wd ─────────────────────────────────────────────────────
+
+    def _cmd_vel_cb(self, msg: Twist):
+        cmd = f'V,{msg.linear.x:.4f},{msg.angular.z:.4f}\n'
+        try:
+            self.ser.write(cmd.encode('utf-8'))
+        except Exception as e:
+            self.get_logger().warn(f'Serial write error: {e}')
+
+    # ── Serial reader thread ──────────────────────────────────────────────────
+
+    def _read_loop(self):
+        while rclpy.ok():
+            try:
+                if self.ser.in_waiting > 0:
+                    raw  = self.ser.readline()
+                    line = raw.decode('utf-8', errors='replace').strip()
+                    if line:
+                        self._parse(line)
+            except Exception as e:
+                self.get_logger().error(f'Serial read error: {e}')
+
+    # ── Line parser ───────────────────────────────────────────────────────────
+
+    def _parse(self, line: str):
+        if line == 'READY':
+            self.get_logger().info('Arduino sent READY — resetting odometry.')
+            self.x = self.y = self.theta = 0.0
+            self.last_odom_time = None
+            return
+
+        parts  = line.split(',')
+        prefix = parts[0]
+
+        try:
+            if prefix == 'O' and len(parts) == 3:
+                v = float(parts[1])
+                w = float(parts[2])
+                self._publish_odometry(v, w)
+
+        except (ValueError, IndexError) as e:
+            self.get_logger().debug(f'Parse error on "{line}": {e}')
+
+    # ── Dead-reckoning odometry ───────────────────────────────────────────────
+
+    def _publish_odometry(self, v: float, w: float):
+        now_sec = self.get_clock().now().nanoseconds * 1e-9
+
+        if self.last_odom_time is None:
+            self.last_odom_time = now_sec
+            return
+
+        dt = now_sec - self.last_odom_time
+        self.last_odom_time = now_sec
+
+        if dt <= 0.0 or dt > 2.0:
+            return
+
+        # Euler integration — good enough at 20 Hz
+        self.x     += v * math.cos(self.theta) * dt
+        self.y     += v * math.sin(self.theta) * dt
+        self.theta += w * dt
+
+        # Planar quaternion (rotation about Z only)
+        qz = math.sin(self.theta / 2.0)
+        qw = math.cos(self.theta / 2.0)
+
+        stamp = self.get_clock().now().to_msg()
+
+        # TF: odom → base_footprint
+        tf = TransformStamped()
+        tf.header.stamp            = stamp
+        tf.header.frame_id         = 'odom'
+        tf.child_frame_id          = 'base_footprint'
+        tf.transform.translation.x = self.x
+        tf.transform.translation.y = self.y
+        tf.transform.translation.z = 0.0
+        tf.transform.rotation.z    = qz
+        tf.transform.rotation.w    = qw
+        self.tf_broadcaster.sendTransform(tf)
+
+        # /odom topic
+        odom = Odometry()
+        odom.header.stamp            = stamp
+        odom.header.frame_id         = 'odom'
+        odom.child_frame_id          = 'base_footprint'
+        odom.pose.pose.position.x    = self.x
+        odom.pose.pose.position.y    = self.y
+        odom.pose.pose.orientation.z = qz
+        odom.pose.pose.orientation.w = qw
+        odom.twist.twist.linear.x    = v
+        odom.twist.twist.angular.z   = w
+
+        pc = [0.0] * 36
+        pc[0]  = POSE_COV_XY
+        pc[7]  = POSE_COV_XY
+        pc[35] = POSE_COV_THETA
+        odom.pose.covariance = pc
+
+        tc = [0.0] * 36
+        tc[0]  = TWIST_COV_V
+        tc[35] = TWIST_COV_W
+        odom.twist.covariance = tc
+
+        self.odom_pub.publish(odom)
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = SerialBridge()
+    try:
+        rclpy.spin(node)
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':
