@@ -52,6 +52,8 @@ class SerialBridge(Node):
         self.y     = 0.0
         self.theta = 0.0
         self.last_odom_time: float | None = None
+        self.latest_v = 0.0
+        self.latest_w = 0.0
 
         # ── TF broadcaster ───────────────────────────────────────────────────
         self.tf_broadcaster = TransformBroadcaster(self)
@@ -64,6 +66,9 @@ class SerialBridge(Node):
 
         # ── Subscriber ───────────────────────────────────────────────────────
         self.create_subscription(Twist, 'cmd_vel', self.cmd_vel_callback, 10)
+
+        # ── Odometry timer (20 Hz, runs on executor thread) ──────────────────
+        self.create_timer(0.05, self.odom_timer_callback)
 
         # ── Serial reader thread ──────────────────────────────────────────────
         self.read_thread = threading.Thread(target=self.read_serial_loop, daemon=True)
@@ -126,9 +131,8 @@ class SerialBridge(Node):
 
             # ── Odometry ─────────────────────────────────────────────────────
             elif prefix == 'O' and len(parts) == 3:
-                v = float(parts[1])
-                w = float(parts[2])
-                self.publish_odometry(v, w)
+                self.latest_v = float(parts[1])
+                self.latest_w = float(parts[2])
 
             # ── SCD30 ─────────────────────────────────────────────────────────
             elif prefix == 'C' and len(parts) == 4:
@@ -149,10 +153,15 @@ class SerialBridge(Node):
         except (ValueError, IndexError) as e:
             self.get_logger().debug(f'Parse error on line "{line}": {e}')
 
-    # ── Odometry integration ──────────────────────────────────────────────────
+    # ── Odometry integration (runs on executor thread via timer) ─────────────
 
-    def publish_odometry(self, v: float, w: float):
-        now_sec = self.get_clock().now().nanoseconds * 1e-9
+    def odom_timer_callback(self):
+        v = self.latest_v
+        w = self.latest_w
+
+        now   = self.get_clock().now()          # single clock read
+        now_sec = now.nanoseconds * 1e-9
+        stamp = now.to_msg()
 
         if self.last_odom_time is None:
             self.last_odom_time = now_sec
@@ -170,8 +179,6 @@ class SerialBridge(Node):
 
         qz = math.sin(self.theta / 2.0)
         qw = math.cos(self.theta / 2.0)
-
-        stamp = self.get_clock().now().to_msg()
 
         # TF: odom → base_footprint
         tf = TransformStamped()
