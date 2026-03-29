@@ -11,7 +11,13 @@ filter to wait forever for a transform that never arrives.
 
 import rclpy
 from rclpy.node import Node
+from rclpy.duration import Duration
 from sensor_msgs.msg import LaserScan
+
+# Stamp scans this far in the past so the TF buffer is guaranteed to
+# have transforms covering the scan timestamp. Must be larger than the
+# TF publish interval (20ms) plus any system latency.
+STAMP_OFFSET = Duration(seconds=0.15)
 
 
 class ScanRelay(Node):
@@ -23,7 +29,7 @@ class ScanRelay(Node):
         self.get_logger().info('Scan relay started: /scan → /scan_corrected')
 
     def callback(self, msg: LaserScan):
-        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.stamp = (self.get_clock().now() - STAMP_OFFSET).to_msg()
         self.pub.publish(msg)
 
 
