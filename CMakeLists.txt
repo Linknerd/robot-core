@@ -10,6 +10,7 @@ find_package(ament_cmake REQUIRED)
 install(PROGRAMS
   robot-core/serial_bridge.py
   robot-core/robot_logic.py
+  robot-core/scan_relay.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

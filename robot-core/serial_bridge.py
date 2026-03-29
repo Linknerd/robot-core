@@ -67,7 +67,7 @@ class SerialBridge(Node):
         self.create_subscription(Twist, 'cmd_vel', self.cmd_vel_callback, 10)
 
         # ── Odometry timer (20 Hz, runs on executor thread) ──────────────────
-        self.create_timer(0.05, self.odom_timer_callback)
+        self.create_timer(0.02, self.odom_timer_callback)
 
         # ── Serial reader thread ──────────────────────────────────────────────
         self.read_thread = threading.Thread(target=self.read_serial_loop, daemon=True)
