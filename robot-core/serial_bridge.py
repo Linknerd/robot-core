@@ -156,14 +156,19 @@ class SerialBridge(Node):
 
     def publish_odometry(self, v: float, w: float):
 
-        now = self.get_clock().now()
+        now   = self.get_clock().now()          # single clock read
+        now_sec = now.nanoseconds * 1e-9
         stamp = now.to_msg()
 
-        # USB buffering causes packets to arrive in bursts.
-        # If we calculate `dt` from the PC clock, the bursts create microscopic `dt` values,
-        # perfectly erasing 80% of your distance! 
-        # Since the Arduino strictly calculates V over 50ms windows, dt is always exactly 0.05s.
-        dt = 0.05
+        if self.last_odom_time is None:
+            self.last_odom_time = now_sec
+            return
+
+        dt = now_sec - self.last_odom_time
+        self.last_odom_time = now_sec
+
+        if dt <= 0.0 or dt > 5.0:
+            return
 
         # Midpoint method for better arc traversal calculation
         self.x     += v * math.cos(self.theta + (w * dt / 2.0)) * dt
