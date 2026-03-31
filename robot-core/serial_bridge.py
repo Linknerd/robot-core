@@ -66,8 +66,7 @@ class SerialBridge(Node):
         # ── Subscriber ───────────────────────────────────────────────────────
         self.create_subscription(Twist, 'cmd_vel', self.cmd_vel_callback, 10)
 
-        # ── Odometry timer (20 Hz, runs on executor thread) ──────────────────
-        self.create_timer(0.02, self.odom_timer_callback)
+        # Odometry timer removed; odometry is published directly on serial receipt.
 
         # ── Serial reader thread ──────────────────────────────────────────────
         self.read_thread = threading.Thread(target=self.read_serial_loop, daemon=True)
@@ -93,8 +92,8 @@ class SerialBridge(Node):
     def read_serial_loop(self):
         while rclpy.ok():
             try:
-                if self.ser.in_waiting > 0:
-                    raw  = self.ser.readline()
+                raw = self.ser.readline()
+                if raw:
                     line = raw.decode('utf-8', errors='replace').strip()
                     if line:
                         self.parse_line(line)
@@ -130,8 +129,9 @@ class SerialBridge(Node):
 
             # ── Odometry ─────────────────────────────────────────────────────
             elif prefix == 'O' and len(parts) == 3:
-                self.latest_v = float(parts[1])
-                self.latest_w = float(parts[2])
+                v = float(parts[1])
+                w = float(parts[2])
+                self.publish_odometry(v, w)
 
             # ── SCD30 ─────────────────────────────────────────────────────────
             elif prefix == 'C' and len(parts) == 4:
@@ -152,11 +152,9 @@ class SerialBridge(Node):
         except (ValueError, IndexError) as e:
             self.get_logger().debug(f'Parse error on line "{line}": {e}')
 
-    # ── Odometry integration (runs on executor thread via timer) ─────────────
+    # ── Odometry integration (called on serial receipt) ─────────────
 
-    def odom_timer_callback(self):
-        v = self.latest_v
-        w = self.latest_w
+    def publish_odometry(self, v: float, w: float):
 
         now   = self.get_clock().now()          # single clock read
         now_sec = now.nanoseconds * 1e-9
@@ -172,8 +170,9 @@ class SerialBridge(Node):
         if dt <= 0.0 or dt > 5.0:
             return
 
-        self.x     += v * math.cos(self.theta) * dt
-        self.y     += v * math.sin(self.theta) * dt
+        # Midpoint method for better arc traversal calculation
+        self.x     += v * math.cos(self.theta + (w * dt / 2.0)) * dt
+        self.y     += v * math.sin(self.theta + (w * dt / 2.0)) * dt
         self.theta += w * dt
 
         qz = math.sin(self.theta / 2.0)
