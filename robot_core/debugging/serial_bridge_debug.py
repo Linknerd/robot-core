@@ -49,7 +49,7 @@ class SerialBridge(Node):
         self.last_tick_r = 0
         
         # Physical Constants (MUST match movement_debug.h)
-        self.TPR = 3000.0
+        self.TPR = 12000.0
         self.RHO = 0.0625
         self.ELL = 0.2775
 
