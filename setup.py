@@ -19,6 +19,7 @@ setup(
         'console_scripts': [
             'serial_bridge = robot_core.serial_bridge:main',
             'robot_logic = robot_core.robot_logic:main',
+            'serial_bridge_debug = robot_core.debugging.serial_bridge_debug:main'
         ],
     },
 )
