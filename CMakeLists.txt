@@ -8,9 +8,9 @@ endif()
 find_package(ament_cmake REQUIRED)
 
 install(PROGRAMS
-  robot-core/serial_bridge.py
-  robot-core/robot_logic.py
-  robot-core/scan_relay.py
+  robot_core/serial_bridge.py
+  robot_core/robot_logic.py
+  robot_core/scan_relay.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
