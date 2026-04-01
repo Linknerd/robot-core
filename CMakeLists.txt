@@ -11,6 +11,7 @@ install(PROGRAMS
   robot_core/serial_bridge.py
   robot_core/robot_logic.py
   robot_core/scan_relay.py
+  robot_core/debugging/serial_bridge_debug.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
