@@ -23,7 +23,7 @@ STAMP_OFFSET = Duration(seconds=0.15)
 class ScanRelay(Node):
 
     def __init__(self):
-        super().__init__('scan_relay.py')
+        super().__init__('scan_relay')
         self.pub = self.create_publisher(LaserScan, 'scan_corrected', 10)
         self.create_subscription(LaserScan, 'scan', self.callback, 10)
         self.get_logger().info('Scan relay started: /scan → /scan_corrected')
