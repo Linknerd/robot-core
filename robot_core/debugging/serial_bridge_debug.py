@@ -238,8 +238,8 @@ class SerialBridge(Node):
             return  # Skip pathological updates (e.g. duplicate packets)
 
         # 3. Compute absolute wheel displacement in meters
-        d_left  = 2.0 * math.pi * (delta_l / self.TPR) * self.RHO
-        d_right = 2.0 * math.pi * (delta_r / self.TPR) * self.RHO
+        d_left  = -2.0 * math.pi * (delta_l / self.TPR) * self.RHO
+        d_right = -2.0 * math.pi * (delta_r / self.TPR) * self.RHO
 
         # 4. Compute robot translation and rotation (Differential Drive)
         d_center = (d_left + d_right) / 2.0
