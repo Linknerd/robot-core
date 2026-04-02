@@ -27,7 +27,7 @@ class SerialBridge(Node):
 
         # ── Serial ───────────────────────────────────────────────────────────
         self.port     = '/dev/ttyACM0'
-        self.baudrate = 115200
+        self.baudrate = 57600
         try:
             self.ser = serial.Serial(self.port, self.baudrate, timeout=1.0)
             self.get_logger().info(f'Connected to Arduino on {self.port}')
@@ -238,7 +238,7 @@ class SerialBridge(Node):
             return  # Skip pathological updates (e.g. duplicate packets)
 
         # 3. Compute absolute wheel displacement in meters
-        d_left  = -2.0 * math.pi * (delta_l / self.TPR) * self.RHO
+        d_left  = 2.0 * math.pi * (delta_l / self.TPR) * self.RHO
         d_right = -2.0 * math.pi * (delta_r / self.TPR) * self.RHO
 
         # 4. Compute robot translation and rotation (Differential Drive)
