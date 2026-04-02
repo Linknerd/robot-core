@@ -4,15 +4,26 @@ serial_bridge.py — ROS2 Humble
 Bridges the Arduino (robot_controller) to ROS2 topics.
 
 Serial protocol (Arduino → Pi):
-  I,ax,ay,az,gx,gy,gz        IMU (accel in g, gyro in deg/s)
   O,linear_m_s,angular_rad_s  Odometry velocities (computed on Arduino, sent every T ms)
+  I,ax,ay,az,gx,gy,gz        IMU (accel in g, gyro in deg/s)
   C,temp,humidity,co2         SCD30 environmental sensor
   S,d0,d1,d2                  Sharp IR distances (cm)
   E,message                   Arduino error string
 
 Serial protocol (Pi → Arduino):
-  V,vd,wd\n                   Desired linear [m/s] and angular [rad/s] velocity
-  S\n                         Stop
+  V,vd,wd\\n                   Desired linear [m/s] and angular [rad/s] velocity
+  S\\n                         Stop
+
+Odometry architecture
+---------------------
+Integration is EVENT-DRIVEN: pose is updated the instant each "O" line is
+parsed, using the ROS clock Δt between consecutive O arrivals.  This is the
+only correct approach when the serial reader and the ROS executor run on
+different threads at different rates.
+
+A separate 20 Hz timer ONLY publishes the already-integrated pose — it does
+NOT reintegrate.  This keeps the TF/odom topics at a predictable rate without
+coupling the integration accuracy to the publish rate.
 """
 
 import math
@@ -30,6 +41,18 @@ from std_msgs.msg import Float32MultiArray
 from tf2_ros import TransformBroadcaster
 
 
+# ── Calibration knob ─────────────────────────────────────────────────────────
+#
+# If the robot physically travels 1 m but /odom reports X m, set:
+#   VEL_SCALE = 1.0 / X
+#
+# Example: robot moved 1 m, /odom reported 0.1 m  →  VEL_SCALE = 10.0
+# Example: robot moved 1 m, /odom reported 1.5 m  →  VEL_SCALE = 0.667
+#
+# Set to 1.0 once RHO and TPR on the Arduino are correctly calibrated.
+VEL_SCALE = 1.0
+
+
 class SerialBridge(Node):
 
     def __init__(self):
@@ -40,19 +63,30 @@ class SerialBridge(Node):
         self.port     = '/dev/ttyACM0'
         self.baudrate = 115200
         try:
-            self.ser = serial.Serial(self.port, self.baudrate, timeout=1.0)
+            # timeout=0.1 s — short enough that a missing newline doesn't
+            # stall the reader thread for a full second (the old bug).
+            self.ser = serial.Serial(self.port, self.baudrate, timeout=0.1)
             self.get_logger().info(f'Connected to Arduino on {self.port}')
         except serial.SerialException as e:
             self.get_logger().error(f'Failed to open serial port: {e}')
             raise
 
-        # ── Odometry state ───────────────────────────────────────────────────
-        self.x     = 0.0
-        self.y     = 0.0
-        self.theta = 0.0
+        # ── Odometry state (protected by _odom_lock) ─────────────────────────
+        #
+        # ALL reads and writes to x, y, theta, last_odom_time, latest_v,
+        # latest_w MUST be done while holding _odom_lock.  The serial reader
+        # thread integrates here; the publish timer reads here.
+        self._odom_lock   = threading.Lock()
+        self.x            = 0.0
+        self.y            = 0.0
+        self.theta        = 0.0
         self.last_odom_time: float | None = None
-        self.latest_v = 0.0
-        self.latest_w = 0.0
+        self.latest_v     = 0.0   # last received linear  velocity [m/s]
+        self.latest_w     = 0.0   # last received angular velocity [rad/s]
+
+        # Diagnostic counters (only read/written under _odom_lock too)
+        self._odom_msgs_received = 0
+        self._last_diag_time: float | None = None
 
         # ── TF broadcaster ───────────────────────────────────────────────────
         self.tf_broadcaster = TransformBroadcaster(self)
@@ -66,8 +100,10 @@ class SerialBridge(Node):
         # ── Subscriber ───────────────────────────────────────────────────────
         self.create_subscription(Twist, 'cmd_vel', self.cmd_vel_callback, 10)
 
-        # ── Odometry timer (20 Hz, runs on executor thread) ──────────────────
-        self.create_timer(0.02, self.odom_timer_callback)
+        # ── Publish timer (20 Hz) ─────────────────────────────────────────────
+        # This timer ONLY publishes the current pose.  It does NOT integrate.
+        # Integration happens event-driven in _integrate_odom() below.
+        self.create_timer(0.05, self.publish_odom_callback)
 
         # ── Serial reader thread ──────────────────────────────────────────────
         self.read_thread = threading.Thread(target=self.read_serial_loop, daemon=True)
@@ -93,13 +129,19 @@ class SerialBridge(Node):
     def read_serial_loop(self):
         while rclpy.ok():
             try:
-                if self.ser.in_waiting > 0:
-                    raw  = self.ser.readline()
-                    line = raw.decode('utf-8', errors='replace').strip()
-                    if line:
-                        self.parse_line(line)
-            except Exception as e:
+                # readline() now has a 0.1 s timeout — if no '\n' arrives it
+                # returns an empty/partial bytes object rather than blocking
+                # for a full second as in the old code.
+                raw = self.ser.readline()
+                if not raw:
+                    continue
+                line = raw.decode('utf-8', errors='replace').strip()
+                if line:
+                    self.parse_line(line)
+            except serial.SerialException as e:
                 self.get_logger().error(f'Serial read error: {e}')
+            except Exception as e:
+                self.get_logger().debug(f'Read loop error: {e}')
 
     # ── Line parser ───────────────────────────────────────────────────────────
 
@@ -108,6 +150,17 @@ class SerialBridge(Node):
         prefix = parts[0]
 
         try:
+            # ── Odometry ─────────────────────────────────────────────────────
+            # This is the critical path.  We integrate immediately on receipt
+            # of each O message using the ROS clock Δt between consecutive O
+            # arrivals.  This is the ONLY correct approach; a decoupled timer
+            # integrating stale latest_v values causes scale errors.
+            if prefix == 'O' and len(parts) == 3:
+                v_raw = float(parts[1]) * VEL_SCALE
+                w_raw = float(parts[2]) * VEL_SCALE
+                self._integrate_odom(v_raw, w_raw)
+                return
+
             # ── IMU ──────────────────────────────────────────────────────────
             if prefix == 'I' and len(parts) == 7:
                 msg = Imu()
@@ -128,11 +181,6 @@ class SerialBridge(Node):
                 msg.angular_velocity_covariance[8]    = 0.005
                 self.imu_pub.publish(msg)
 
-            # ── Odometry ─────────────────────────────────────────────────────
-            elif prefix == 'O' and len(parts) == 3:
-                self.latest_v = float(parts[1])
-                self.latest_w = float(parts[2])
-
             # ── SCD30 ─────────────────────────────────────────────────────────
             elif prefix == 'C' and len(parts) == 4:
                 msg      = Float32MultiArray()
@@ -152,66 +200,125 @@ class SerialBridge(Node):
         except (ValueError, IndexError) as e:
             self.get_logger().debug(f'Parse error on line "{line}": {e}')
 
-    # ── Odometry integration (runs on executor thread via timer) ─────────────
+    # ── Event-driven odometry integration ─────────────────────────────────────
 
-    def odom_timer_callback(self):
-        v = self.latest_v
-        w = self.latest_w
+    def _integrate_odom(self, v: float, w: float):
+        """
+        Called from the serial reader thread every time an O message arrives.
 
-        now   = self.get_clock().now()          # single clock read
-        now_sec = now.nanoseconds * 1e-9
+        Uses the ROS clock Δt between consecutive O arrivals as the integration
+        step.  This is accurate because both the Arduino T period and the ROS
+        clock are stable; any small jitter is naturally absorbed by the real Δt.
+
+        Midpoint (2nd-order Runge-Kutta) integration is used:
+            theta_mid = theta + 0.5 * w * dt
+            x        += v * cos(theta_mid) * dt
+            y        += v * sin(theta_mid) * dt
+            theta    += w * dt
+
+        This halves the heading discretisation error compared to forward Euler
+        with no additional computational cost.
+        """
+        now_sec = self.get_clock().now().nanoseconds * 1e-9
+
+        with self._odom_lock:
+            self.latest_v = v
+            self.latest_w = w
+            self._odom_msgs_received += 1
+
+            # ── First message — seed the clock, nothing to integrate yet ──────
+            if self.last_odom_time is None:
+                self.last_odom_time  = now_sec
+                self._last_diag_time = now_sec
+                return
+
+            dt = now_sec - self.last_odom_time
+            self.last_odom_time = now_sec
+
+            # Sanity-check dt: ignore if clock jumped or first tick is huge
+            if dt <= 0.0 or dt > 1.0:
+                self.get_logger().warn(
+                    f'Odom dt out of range ({dt:.3f} s), skipping integration.'
+                )
+                return
+
+            # ── Midpoint integration ──────────────────────────────────────────
+            theta_mid   = self.theta + 0.5 * w * dt
+            self.x     += v * math.cos(theta_mid) * dt
+            self.y     += v * math.sin(theta_mid) * dt
+            self.theta += w * dt
+
+            # ── Diagnostic: log v, w, and pose at 5 Hz ────────────────────────
+            if now_sec - self._last_diag_time >= 5.0:
+                self.get_logger().info(
+                    f'[odom diag] msgs={self._odom_msgs_received}  '
+                    f'v={v:.4f} m/s  w={w:.4f} rad/s  '
+                    f'x={self.x:.3f}  y={self.y:.3f}  '
+                    f'θ={math.degrees(self.theta):.1f}°  '
+                    f'dt={dt*1000:.1f} ms'
+                )
+                self._last_diag_time = now_sec
+
+    # ── Odometry publisher (20 Hz, read-only) ─────────────────────────────────
+
+    def publish_odom_callback(self):
+        """
+        Publishes the current integrated pose as /odom and the odom→base_footprint
+        TF.  Does NOT integrate — that happens in _integrate_odom().
+        """
+        with self._odom_lock:
+            x     = self.x
+            y     = self.y
+            theta = self.theta
+            v     = self.latest_v
+            w     = self.latest_w
+
+        now   = self.get_clock().now()
         stamp = now.to_msg()
 
-        if self.last_odom_time is None:
-            self.last_odom_time = now_sec
-            return
+        qz = math.sin(theta / 2.0)
+        qw = math.cos(theta / 2.0)
 
-        dt = now_sec - self.last_odom_time
-        self.last_odom_time = now_sec
-
-        if dt <= 0.0 or dt > 5.0:
-            return
-
-        self.x     += v * math.cos(self.theta) * dt
-        self.y     += v * math.sin(self.theta) * dt
-        self.theta += w * dt
-
-        qz = math.sin(self.theta / 2.0)
-        qw = math.cos(self.theta / 2.0)
-
-        # TF: odom → base_footprint
+        # ── TF: odom → base_footprint ─────────────────────────────────────────
         tf = TransformStamped()
         tf.header.stamp            = stamp
         tf.header.frame_id         = 'odom'
         tf.child_frame_id          = 'base_footprint'
-        tf.transform.translation.x = self.x
-        tf.transform.translation.y = self.y
+        tf.transform.translation.x = x
+        tf.transform.translation.y = y
         tf.transform.translation.z = 0.0
+        tf.transform.rotation.x    = 0.0
+        tf.transform.rotation.y    = 0.0
         tf.transform.rotation.z    = qz
         tf.transform.rotation.w    = qw
         self.tf_broadcaster.sendTransform(tf)
 
-        # /odom topic
+        # ── /odom topic ───────────────────────────────────────────────────────
         odom = Odometry()
         odom.header.stamp            = stamp
         odom.header.frame_id         = 'odom'
         odom.child_frame_id          = 'base_footprint'
-        odom.pose.pose.position.x    = self.x
-        odom.pose.pose.position.y    = self.y
+        odom.pose.pose.position.x    = x
+        odom.pose.pose.position.y    = y
+        odom.pose.pose.position.z    = 0.0
+        odom.pose.pose.orientation.x = 0.0
+        odom.pose.pose.orientation.y = 0.0
         odom.pose.pose.orientation.z = qz
         odom.pose.pose.orientation.w = qw
         odom.twist.twist.linear.x    = v
         odom.twist.twist.angular.z   = w
 
+        # Pose covariance (position uncertainty grows with dead-reckoning error)
         pc = [0.0] * 36
-        pc[0]  = 0.05
-        pc[7]  = 0.05
-        pc[35] = 0.1
+        pc[0]  = 0.1   # x  [m²]
+        pc[7]  = 0.1   # y  [m²]
+        pc[35] = 0.2   # yaw [rad²]
         odom.pose.covariance = pc
 
+        # Twist covariance (uncertainty in the reported velocity)
         tc = [0.0] * 36
-        tc[0]  = 0.01
-        tc[35] = 0.05
+        tc[0]  = 0.05   # linear  [m/s²]
+        tc[35] = 0.1    # angular [rad/s²]
         odom.twist.covariance = tc
 
         self.odom_pub.publish(odom)
