@@ -2,6 +2,15 @@
 """
 serial_bridge_debug.py — ROS2 Humble
 Bridges the Arduino (robot_controller_debug) to ROS2 topics.
+
+Serial Protocol:
+  Pi → Arduino:  V,<vd>,<wd>\n   — set linear [m/s] and angular [rad/s] velocity
+                 S\n             — emergency stop
+  Arduino → Pi:  O,<v>,<w>\n    — measured vehicle speed and turn rate
+                 I,ax,ay,az,gx,gy,gz\n  — IMU data
+                 C,co2,temp,hum\n        — SCD30 data
+                 S,d1,d2,...\n           — Sharp IR distances
+                 E,<msg>\n               — Arduino error/warning
 """
 
 import math
@@ -23,11 +32,11 @@ class SerialBridge(Node):
 
     def __init__(self):
         super().__init__('serial_bridge_debug')
-        self.get_logger().info('Serial Bridge Node started (DEBUG MODE - Absolute Ticks)')
+        self.get_logger().info('Serial Bridge Node started (DEBUG MODE)')
 
         # ── Serial ───────────────────────────────────────────────────────────
         self.port     = '/dev/ttyACM0'
-        self.baudrate = 115200
+        self.baudrate = 57600
         try:
             self.ser = serial.Serial(self.port, self.baudrate, timeout=1.0)
             self.get_logger().info(f'Connected to Arduino on {self.port}')
@@ -39,19 +48,10 @@ class SerialBridge(Node):
         self.x     = 0.0
         self.y     = 0.0
         self.theta = 0.0
-        
-        # [DEBUG] Replaced host-time variables with Arduino Absolute variables
-        # // self.last_odom_time: float | None = None
-        # // self.latest_v = 0.0
-        # // self.latest_w = 0.0
-        self.last_arduino_t_ms = None
-        self.last_tick_l = 0
-        self.last_tick_r = 0
-        
-        # Physical Constants (MUST match movement_debug.h)
-        self.TPR = 12000.0
-        self.RHO = 0.0625
-        self.ELL = 0.2775
+
+        self.last_odom_time: float | None = None
+        self.latest_v = 0.0
+        self.latest_w = 0.0
 
         # ── TF broadcaster ───────────────────────────────────────────────────
         self.tf_broadcaster = TransformBroadcaster(self)
@@ -113,19 +113,11 @@ class SerialBridge(Node):
                 msg.angular_velocity_covariance[8]    = 0.005
                 self.imu_pub.publish(msg)
 
-            # ── Odometry ─────────────────────────────────────────────────────
-            # [DEBUG] Original Parsing Block:
-            # // elif prefix == 'O' and len(parts) == 3:
-            # //     v = float(parts[1])
-            # //     w = float(parts[2])
-            # //     self.publish_odometry(v, w)
-            
-            # [DEBUG] New Absolute Tick Parsing Block:
-            elif prefix == 'O' and len(parts) == 4:
-                 t_ms   = int(parts[1])
-                 tick_l = int(parts[2])
-                 tick_r = int(parts[3])
-                 self.publish_odometry_cumulative(t_ms, tick_l, tick_r)
+            # ── Odometry: O,<linear_m_s>,<angular_rad_s> ─────────────────────
+            elif prefix == 'O' and len(parts) == 3:
+                v = float(parts[1])
+                w = float(parts[2])
+                self.publish_odometry(v, w)
 
             elif prefix == 'C' and len(parts) == 4:
                 msg      = Float32MultiArray()
@@ -143,27 +135,28 @@ class SerialBridge(Node):
         except (ValueError, IndexError) as e:
             self.get_logger().debug(f'Parse error on line "{line}": {e}')
 
-    # ── Odometry integration (called on serial receipt) ─────────────
+    # ── Odometry integration ──────────────────────────────────────────────────
 
-    # [DEBUG] Leaving entire old block commented out as requested.
-    """
     def publish_odometry(self, v: float, w: float):
-
-        now   = self.get_clock().now()          # single clock read
+        now     = self.get_clock().now()
         now_sec = now.nanoseconds * 1e-9
-        stamp = now.to_msg()
+        stamp   = now.to_msg()
 
         if self.last_odom_time is None:
             self.last_odom_time = now_sec
+            self.latest_v = v
+            self.latest_w = w
             return
 
         dt = now_sec - self.last_odom_time
         self.last_odom_time = now_sec
+        self.latest_v = v
+        self.latest_w = w
 
         if dt <= 0.0 or dt > 5.0:
             return
 
-        # Midpoint method for better arc traversal calculation
+        # Midpoint integration for smooth arc traversal
         self.x     += v * math.cos(self.theta + (w * dt / 2.0)) * dt
         self.y     += v * math.sin(self.theta + (w * dt / 2.0)) * dt
         self.theta += w * dt
@@ -195,95 +188,6 @@ class SerialBridge(Node):
         odom.twist.twist.linear.x    = v
         odom.twist.twist.angular.z   = w
 
-        pc = [0.0] * 36
-        pc[0]  = 0.05
-        pc[7]  = 0.05
-        pc[35] = 0.1
-        odom.pose.covariance = pc
-
-        tc = [0.0] * 36
-        tc[0]  = 0.01
-        tc[35] = 0.05
-        odom.twist.covariance = tc
-
-        self.odom_pub.publish(odom)
-    """
-
-    def publish_odometry_cumulative(self, t_ms: int, tick_l: int, tick_r: int):
-        now = self.get_clock().now()
-        stamp = now.to_msg()
-
-        if self.last_arduino_t_ms is None:
-            self.last_arduino_t_ms = t_ms
-            self.last_tick_l = tick_l
-            self.last_tick_r = tick_r
-            return
-
-        # 1. Compute exactly how much time passed ON THE ARDUINO.
-        dt = (t_ms - self.last_arduino_t_ms) / 1000.0
-        
-        # Protect against integer wrap-around on millis() ~49 days
-        if dt < 0:
-            dt += 4294967.296
-
-        # 2. Compute exact ticks elapsed
-        delta_l = tick_l - self.last_tick_l
-        delta_r = tick_r - self.last_tick_r
-        
-        self.last_arduino_t_ms = t_ms
-        self.last_tick_l       = tick_l
-        self.last_tick_r       = tick_r
-
-        if dt <= 0.001 or dt > 5.0:
-            return  # Skip pathological updates (e.g. duplicate packets)
-
-        # 3. Compute absolute wheel displacement in meters
-        d_left  = -2.0 * math.pi * (delta_l / self.TPR) * self.RHO
-        d_right = -2.0 * math.pi * (delta_r / self.TPR) * self.RHO
-
-        # 4. Compute robot translation and rotation (Differential Drive)
-        d_center = (d_left + d_right) / 2.0
-        d_theta  = (d_right - d_left) / self.ELL
-        
-        # 5. Compute instantaneous velocity (strictly for Twist covariance/publishing)
-        v = d_center / dt
-        w = d_theta / dt
-
-        # 6. Accumulate exactly the distance traveled
-        self.x     += d_center * math.cos(self.theta + (d_theta / 2.0))
-        self.y     += d_center * math.sin(self.theta + (d_theta / 2.0))
-        self.theta += d_theta
-
-        qz = math.sin(self.theta / 2.0)
-        qw = math.cos(self.theta / 2.0)
-
-        # TF: odom → base_footprint
-        tf = TransformStamped()
-        tf.header.stamp            = stamp
-        tf.header.frame_id         = 'odom'
-        tf.child_frame_id          = 'base_footprint'
-        tf.transform.translation.x = self.x
-        tf.transform.translation.y = self.y
-        tf.transform.translation.z = 0.0
-        tf.transform.rotation.z    = qz
-        tf.transform.rotation.w    = qw
-        self.tf_broadcaster.sendTransform(tf)
-
-        # /odom topic
-        odom = Odometry()
-        odom.header.stamp            = stamp
-        odom.header.frame_id         = 'odom'
-        odom.child_frame_id          = 'base_footprint'
-        odom.pose.pose.position.x    = self.x
-        odom.pose.pose.position.y    = self.y
-        odom.pose.pose.orientation.z = qz
-        odom.pose.pose.orientation.w = qw
-        odom.twist.twist.linear.x    = v
-        odom.twist.twist.angular.z   = w
-
-        # Note: If SLAM mapping continues to jitter with this absolute odometry fix,
-        # you may need to increase these static covariances so Cartographer/AMCL
-        # relies more heavily on the Lidar.
         pc = [0.0] * 36
         pc[0]  = 0.05
         pc[7]  = 0.05
