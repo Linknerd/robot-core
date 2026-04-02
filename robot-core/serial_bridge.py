@@ -50,7 +50,7 @@ from tf2_ros import TransformBroadcaster
 # Example: robot moved 1 m, /odom reported 1.5 m  →  VEL_SCALE = 0.667
 #
 # Set to 1.0 once RHO and TPR on the Arduino are correctly calibrated.
-VEL_SCALE = 1.0
+VEL_SCALE = 83.33
 
 
 class SerialBridge(Node):
